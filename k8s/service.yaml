@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudbridge-gateway
+  namespace: cloudbridge
+  labels:
+    app: cloudbridge-gateway
+spec:
+  selector:
+    app: cloudbridge-gateway
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http
+  type: ClusterIP
+---
+# Headless service — enables direct pod addressing for future NFS simulation tests
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudbridge-gateway-headless
+  namespace: cloudbridge
+  labels:
+    app: cloudbridge-gateway
+spec:
+  clusterIP: None
+  selector:
+    app: cloudbridge-gateway
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: http
