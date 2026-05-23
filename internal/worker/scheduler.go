@@ -2,94 +2,133 @@ package worker
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
-	"github.com/yashg493/cloudbridge/internal/cloud"
 	"github.com/yashg493/cloudbridge/internal/models"
 	"github.com/yashg493/cloudbridge/internal/store"
 )
 
-// Scheduler periodically scans for files that have crossed an inactivity threshold
-// and enqueues tiering jobs to move them to cheaper storage.
+const (
+	schedulerInterval  = 2 * time.Second
+	schedulerPollLimit = 50
+	schedulerPollTimeout = 10 * time.Second
+)
+
+// Scheduler polls the database for pending sync jobs every 2 seconds and
+// submits them to the WorkerPool. It is the bridge between the durable DB
+// queue and the in-process goroutine pool.
 //
-// Policy (configurable via constructor options in a future phase):
-//   - hot → warm  after hotThreshold  of no access  (default 7 days)
-//   - warm → cold after warmThreshold of no access  (default 30 days)
+// Concurrency safety:
+//   - PollPending uses SELECT FOR UPDATE SKIP LOCKED, so multiple Scheduler
+//     instances (one per pod) can run concurrently without double-processing.
+//   - On ErrPoolFull the scheduler resets unsubmitted jobs to "pending" so
+//     the next poll cycle can reclaim them.
 type Scheduler struct {
-	pool         *Pool
-	fileRepo     *store.FileRepo
-	provider     cloud.Provider
-	logger       *zap.Logger
-	interval     time.Duration // how often to run the scan
-	hotThreshold time.Duration // inactivity before hot→warm promotion
-	warmThreshold time.Duration // inactivity before warm→cold promotion
+	pool    *WorkerPool
+	jobRepo *store.SyncJobRepo
+	logger  *zap.Logger
+	done    chan struct{}
+	once    sync.Once
 }
 
-// NewScheduler creates a Scheduler with sensible default tier thresholds.
-func NewScheduler(
-	pool *Pool,
-	fileRepo *store.FileRepo,
-	provider cloud.Provider,
-	logger *zap.Logger,
-	interval time.Duration,
-) *Scheduler {
+// NewScheduler creates a Scheduler. Call Start() to begin polling.
+func NewScheduler(pool *WorkerPool, jobRepo *store.SyncJobRepo, logger *zap.Logger) *Scheduler {
 	return &Scheduler{
-		pool:          pool,
-		fileRepo:      fileRepo,
-		provider:      provider,
-		logger:        logger,
-		interval:      interval,
-		hotThreshold:  7 * 24 * time.Hour,
-		warmThreshold: 30 * 24 * time.Hour,
+		pool:    pool,
+		jobRepo: jobRepo,
+		logger:  logger,
+		done:    make(chan struct{}),
 	}
 }
 
-// Run starts the scheduling loop and blocks until ctx is cancelled.
-// Designed to run as a background goroutine: go scheduler.Run(ctx).
-func (s *Scheduler) Run(ctx context.Context) {
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-
-	s.logger.Info("tiering scheduler started",
-		zap.Duration("interval", s.interval),
-		zap.Duration("hot_threshold", s.hotThreshold),
-		zap.Duration("warm_threshold", s.warmThreshold),
+// Start launches the polling goroutine. Non-blocking.
+func (s *Scheduler) Start() {
+	go s.run()
+	s.logger.Info("scheduler started",
+		zap.Duration("interval", schedulerInterval),
+		zap.Int("poll_limit", schedulerPollLimit),
 	)
+}
+
+// Stop signals the polling goroutine to exit. Idempotent and safe to call
+// multiple times or from multiple goroutines.
+func (s *Scheduler) Stop() {
+	s.once.Do(func() {
+		close(s.done)
+		s.logger.Info("scheduler stopped")
+	})
+}
+
+// run is the main polling loop.
+func (s *Scheduler) run() {
+	ticker := time.NewTicker(schedulerInterval)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
-			s.logger.Info("tiering scheduler stopped")
+		case <-s.done:
 			return
-		case t := <-ticker.C:
-			s.logger.Debug("tiering scan tick", zap.Time("tick", t))
-			s.scanAndEnqueue(ctx)
+		case <-ticker.C:
+			s.poll()
 		}
 	}
 }
 
-// scanAndEnqueue queries for files that have breached their tier threshold and
-// submits SyncJobs to the pool. This is a best-effort operation — failures are
-// logged but not fatal; the next tick will retry any missed files.
-func (s *Scheduler) scanAndEnqueue(ctx context.Context) {
-	// TODO: query DB for hot files with accessed_at < NOW() - s.hotThreshold
-	//       SELECT id FROM files WHERE tier='hot' AND status='active'
-	//       AND accessed_at < NOW() - INTERVAL '7 days'
-	//       LIMIT 100 (batch to avoid lock contention)
-	// TODO: for each file, create NewSyncJob(..., models.TierWarm, ...) and s.pool.Submit(job)
+// poll fetches a batch of pending jobs from the DB, submits them to the pool,
+// and resets any that could not be submitted back to "pending".
+func (s *Scheduler) poll() {
+	ctx, cancel := context.WithTimeout(context.Background(), schedulerPollTimeout)
+	defer cancel()
 
-	// TODO: query DB for warm files with accessed_at < NOW() - s.warmThreshold
-	//       SELECT id FROM files WHERE tier='warm' AND status='active'
-	//       AND accessed_at < NOW() - INTERVAL '30 days'
-	// TODO: for each file, create NewSyncJob(..., models.TierCold, ...) and s.pool.Submit(job)
+	jobs, err := s.jobRepo.PollPending(ctx, schedulerPollLimit)
+	if err != nil {
+		s.logger.Error("scheduler: poll pending failed", zap.Error(err))
+		return
+	}
+	if len(jobs) == 0 {
+		return
+	}
 
-	// TODO: log enqueued counts per tier transition
+	var submitted int
+	for i, job := range jobs {
+		if err := s.pool.Submit(job); err != nil {
+			if errors.Is(err, ErrPoolFull) {
+				// Pool is saturated. Reset this job and all remaining ones
+				// to "pending" so the next poll cycle can reclaim them.
+				remaining := jobs[i:]
+				s.logger.Warn("pool full; requeueing jobs to pending",
+					zap.Int("count", len(remaining)),
+				)
+				for _, r := range remaining {
+					if rstErr := s.jobRepo.UpdateStatus(
+						ctx, r.ID,
+						string(models.SyncStatusPending), ""); rstErr != nil {
+						s.logger.Error("failed to reset job to pending",
+							zap.String("job_id", r.ID.String()),
+							zap.Error(rstErr),
+						)
+					}
+				}
+				break
+			}
+			// Unexpected submit error (pool shutting down); log and stop polling.
+			s.logger.Error("scheduler: submit error",
+				zap.String("job_id", job.ID.String()),
+				zap.Error(err),
+			)
+			break
+		}
+		submitted++
+	}
 
-	// Ensure models package stays imported until queries are implemented.
-	_ = models.TierWarm
-	_ = models.TierCold
-
-	s.logger.Debug("tiering scan complete (not yet implemented)")
+	if submitted > 0 {
+		s.logger.Info("scheduler: jobs submitted",
+			zap.Int("submitted", submitted),
+			zap.Int("polled", len(jobs)),
+		)
+	}
 }

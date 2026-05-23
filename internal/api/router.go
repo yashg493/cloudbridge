@@ -19,7 +19,7 @@ type RouterConfig struct {
 	Pool       *pgxpool.Pool
 	FileRepo   *store.FileRepo
 	NSRepo     *store.NamespaceRepo
-	WorkerPool *worker.Pool
+	WorkerPool *worker.WorkerPool
 	MetricsReg *metrics.Registry
 }
 

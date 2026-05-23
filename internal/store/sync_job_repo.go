@@ -81,6 +81,15 @@ const (
 		LIMIT  @limit OFFSET @offset`
 
 	sqlSJCountByStatus = `SELECT status, COUNT(*) FROM sync_jobs GROUP BY status`
+
+	// RequeueWithRetry resets a failed/running job back to pending and increments
+	// retry_count atomically — used by ProcessJob's exponential back-off path.
+	sqlSJRequeueWithRetry = `
+		UPDATE sync_jobs
+		SET    status        = 'pending',
+		       retry_count   = retry_count + 1,
+		       error_message = @error_message
+		WHERE  id = @id`
 )
 
 // SyncJobRepo handles persistence of SyncJob records.
@@ -211,6 +220,20 @@ func (r *SyncJobRepo) CountByStatus(ctx context.Context) (map[string]int64, erro
 		return nil, fmt.Errorf("sync_job_repo.CountByStatus: %w", err)
 	}
 	return counts, nil
+}
+
+// RequeueWithRetry resets the job to "pending" and increments retry_count by one.
+// It is called by ProcessJob after a transient error and exponential back-off sleep,
+// so the Scheduler can reclaim the job on its next poll cycle.
+func (r *SyncJobRepo) RequeueWithRetry(ctx context.Context, id uuid.UUID, errMsg string) error {
+	_, err := r.pool.Exec(ctx, sqlSJRequeueWithRetry, pgx.NamedArgs{
+		"id":            id,
+		"error_message": errMsg,
+	})
+	if err != nil {
+		return fmt.Errorf("sync_job_repo.RequeueWithRetry: %w", err)
+	}
+	return nil
 }
 
 // collectJobRows drains pgx.Rows into a []*models.SyncJob slice.

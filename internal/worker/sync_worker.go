@@ -3,105 +3,293 @@ package worker
 import (
 	"context"
 	"fmt"
+	"io"
+	"strings"
+	"time"
 
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/yashg493/cloudbridge/internal/cloud"
 	"github.com/yashg493/cloudbridge/internal/models"
-	"github.com/yashg493/cloudbridge/internal/store"
 )
 
-// SyncJob implements Job for file tiering and cloud synchronisation operations.
-// It is the primary way file data moves between hot (NFS) and warm/cold (cloud) tiers.
-type SyncJob struct {
-	id         string
-	jobType    string // matches models.SyncOperation values
-	fileID     uuid.UUID
-	targetTier models.TierType
-	fileRepo   *store.FileRepo
-	provider   cloud.Provider
-	logger     *zap.Logger
-}
-
-// Compile-time assertion that SyncJob satisfies the Job interface.
-var _ Job = (*SyncJob)(nil)
-
-// NewSyncJob constructs a SyncJob. jobType should be one of the SyncOperation constants.
-func NewSyncJob(
-	fileID uuid.UUID,
-	targetTier models.TierType,
-	jobType string,
-	fileRepo *store.FileRepo,
-	provider cloud.Provider,
-	logger *zap.Logger,
-) *SyncJob {
-	return &SyncJob{
-		id:         uuid.New().String(),
-		jobType:    jobType,
-		fileID:     fileID,
-		targetTier: targetTier,
-		fileRepo:   fileRepo,
-		provider:   provider,
-		logger:     logger,
-	}
-}
-
-// ID implements Job.ID.
-func (j *SyncJob) ID() string { return j.id }
-
-// Type implements Job.Type.
-func (j *SyncJob) Type() string { return j.jobType }
-
-// Execute performs the tier transition for j.fileID.
-//
-// Tier-up (hot → warm/cold):
-//   - fetch file metadata
-//   - open local byte stream (TODO: NFS mount path)
-//   - upload to cloud via j.provider.Upload
-//   - update tier + cloud_key in DB via j.fileRepo.UpdateTier
-//   - mark sync_job as completed
-//
-// Tier-down (warm/cold → hot):
-//   - fetch file metadata
-//   - download from cloud via j.provider.Download
-//   - write to local NFS path (TODO)
-//   - update tier (cloud_key stays for reference) in DB
-//   - mark sync_job as completed
-func (j *SyncJob) Execute(ctx context.Context) error {
-	log := j.logger.With(
-		zap.String("job_id", j.id),
-		zap.String("file_id", j.fileID.String()),
-		zap.String("target_tier", string(j.targetTier)),
-		zap.String("job_type", j.jobType),
+// ProcessJob is the core sync engine. It implements a state machine for a single
+// *models.SyncJob:
+//  1. Mark the job as "running" in the database.
+//  2. Dispatch to the correct operation handler (upload/download/tier_move/delete).
+//  3. On success: record bytes transferred and mark "completed".
+//  4. On transient error (RetryCount < 3): sleep with exponential back-off (1s/2s/4s)
+//     and reset the job to "pending" so the Scheduler can re-claim it.
+//  5. On permanent failure (RetryCount >= 3): mark "failed" and return the error
+//     so the WorkerPool can emit the appropriate metric.
+func ProcessJob(ctx context.Context, job *models.SyncJob, deps Deps) error {
+	log := deps.Logger.With(
+		zap.String("job_id", job.ID.String()),
+		zap.String("file_id", job.FileID.String()),
+		zap.String("namespace_id", job.NamespaceID.String()),
+		zap.String("operation", string(job.Operation)),
+		zap.Int("retry_count", job.RetryCount),
 	)
+
+	// ── Step 1: mark running ──────────────────────────────────────────────────
+	if err := deps.SyncJobRepo.UpdateStatus(
+		ctx, job.ID, string(models.SyncStatusRunning), ""); err != nil {
+		// If we can't mark the job running we still attempt the operation;
+		// the status will be corrected when we mark completed/failed below.
+		log.Warn("failed to mark job as running", zap.Error(err))
+	}
 
 	log.Info("sync job started")
 
-	// TODO: fetch file record — return wrapped error on not-found
-	file, err := j.fileRepo.GetByID(ctx, j.fileID)
-	if err != nil {
-		return fmt.Errorf("sync_job %s: get file: %w", j.id, err)
-	}
+	// ── Step 2: dispatch to operation handler ─────────────────────────────────
+	var bytesTransferred int64
+	var opErr error
 
-	switch j.targetTier {
-	case models.TierWarm, models.TierCold:
-		// TODO: tier-up — upload local file bytes to cloud
-		//   1. open file at NFS mount path (file.Path)
-		//   2. j.provider.Upload(ctx, cloud.UploadInput{...})
-		//   3. j.fileRepo.UpdateTier(ctx, file.ID, j.targetTier, &cloudKey)
-		log.Info("tier-up: uploading to cloud", zap.String("path", file.Path))
-		return fmt.Errorf("sync_job %s: tier-up not implemented", j.id)
-
-	case models.TierHot:
-		// TODO: tier-down / recall — download from cloud to NFS
-		//   1. j.provider.Download(ctx, bucket, *file.CloudKey)
-		//   2. write bytes to NFS path
-		//   3. j.fileRepo.UpdateTier(ctx, file.ID, models.TierHot, nil)
-		log.Info("tier-down: recalling from cloud", zap.String("cloud_key", file.CloudKey))
-		return fmt.Errorf("sync_job %s: tier-down not implemented", j.id)
-
+	switch job.Operation {
+	case models.SyncOperationUpload:
+		bytesTransferred, opErr = execUpload(ctx, job, deps, log)
+	case models.SyncOperationDownload:
+		bytesTransferred, opErr = execDownload(ctx, job, deps, log)
+	case models.SyncOperationTierMove:
+		opErr = execTierMove(ctx, job, deps, log)
+	case models.SyncOperationDelete:
+		opErr = execDelete(ctx, job, deps, log)
 	default:
-		return fmt.Errorf("sync_job %s: unknown target tier %q", j.id, j.targetTier)
+		opErr = fmt.Errorf("unknown operation %q", job.Operation)
 	}
+
+	// ── Step 3: success path ──────────────────────────────────────────────────
+	if opErr == nil {
+		if bytesTransferred > 0 {
+			if err := deps.SyncJobRepo.UpdateProgress(ctx, job.ID, bytesTransferred); err != nil {
+				log.Warn("failed to update bytes_transferred", zap.Error(err))
+			}
+		}
+		if err := deps.SyncJobRepo.UpdateStatus(
+			ctx, job.ID, string(models.SyncStatusCompleted), ""); err != nil {
+			log.Warn("failed to mark job completed", zap.Error(err))
+		}
+		if deps.Metrics != nil {
+			deps.Metrics.TieringOperationsTotal.
+				WithLabelValues(string(job.Operation), "success").Inc()
+		}
+		log.Info("sync job completed", zap.Int64("bytes_transferred", bytesTransferred))
+		return nil
+	}
+
+	// ── Step 4: transient failure — retry with exponential back-off ───────────
+	log.Warn("sync job failed", zap.Error(opErr))
+	if deps.Metrics != nil {
+		deps.Metrics.TieringOperationsTotal.
+			WithLabelValues(string(job.Operation), "error").Inc()
+	}
+
+	if job.RetryCount < 3 {
+		// Backoff schedule: retry 0→1s, 1→2s, 2→4s
+		backoff := time.Duration(1<<uint(job.RetryCount)) * time.Second
+		log.Info("requeueing job with backoff",
+			zap.Duration("backoff", backoff),
+			zap.Int("next_retry_count", job.RetryCount+1),
+		)
+
+		// Sleep while honouring context cancellation (e.g. pool shutdown).
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		// Increment retry_count and reset to pending so the Scheduler picks it up.
+		if err := deps.SyncJobRepo.RequeueWithRetry(ctx, job.ID, opErr.Error()); err != nil {
+			log.Error("failed to requeue job", zap.Error(err))
+		}
+		return nil // error is handled by requeueing — do not propagate
+	}
+
+	// ── Step 5: permanent failure ─────────────────────────────────────────────
+	if err := deps.SyncJobRepo.UpdateStatus(
+		ctx, job.ID, string(models.SyncStatusFailed), opErr.Error()); err != nil {
+		log.Error("failed to mark job as failed", zap.Error(err))
+	}
+	log.Error("sync job permanently failed",
+		zap.Int("retry_count", job.RetryCount),
+		zap.Error(opErr),
+	)
+	return opErr // returned so the WorkerPool increments the failed metric
+}
+
+// ── Operation handlers ────────────────────────────────────────────────────────
+
+// execUpload reads file bytes from the NFS mount path and streams them to the
+// configured cloud provider, then marks the file as cloud-synced in the DB.
+func execUpload(ctx context.Context, job *models.SyncJob, deps Deps, log *zap.Logger) (int64, error) {
+	file, err := deps.FileRepo.GetByID(ctx, job.FileID)
+	if err != nil {
+		return 0, fmt.Errorf("upload: get file metadata: %w", err)
+	}
+
+	ns, err := deps.NSRepo.GetByID(ctx, job.NamespaceID)
+	if err != nil {
+		return 0, fmt.Errorf("upload: get namespace: %w", err)
+	}
+	if ns.CloudBackend == models.CloudBackendNone {
+		return 0, fmt.Errorf("upload: namespace %q has no cloud backend configured", ns.Name)
+	}
+
+	cloudKey := buildCloudKey(ns.CloudPrefix, job.NamespaceID.String(), file.Path)
+
+	// TODO: replace with os.Open(filepath.Join(nfsMountPath, file.Path)) when NFS
+	//       mount points are wired. For now simulate an empty body so the cloud
+	//       provider call is exercised (it will fail with "not implemented" until
+	//       the S3 provider is complete).
+	body := strings.NewReader("")
+
+	log.Info("uploading file to cloud",
+		zap.String("path", file.Path),
+		zap.String("bucket", ns.CloudBucket),
+		zap.String("cloud_key", cloudKey),
+		zap.Int64("size_bytes", file.SizeBytes),
+	)
+
+	info, err := deps.Provider.Upload(ctx, cloud.UploadInput{
+		Bucket:      ns.CloudBucket,
+		Key:         cloudKey,
+		Body:        body,
+		ContentType: "application/octet-stream",
+		SizeBytes:   file.SizeBytes,
+		Metadata: map[string]string{
+			"namespace_id": job.NamespaceID.String(),
+			"file_id":      job.FileID.String(),
+			"path":         file.Path,
+			"checksum":     file.Checksum,
+		},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("upload: cloud provider upload: %w", err)
+	}
+
+	if err := deps.FileRepo.UpdateCloudSync(ctx, job.FileID, info.Key); err != nil {
+		return 0, fmt.Errorf("upload: persist cloud key: %w", err)
+	}
+
+	log.Info("file uploaded", zap.String("etag", info.ETag), zap.String("cloud_key", info.Key))
+	return file.SizeBytes, nil
+}
+
+// execDownload fetches file bytes from cloud storage and writes them to the NFS
+// mount path, then updates the file's tier to hot in the DB.
+func execDownload(ctx context.Context, job *models.SyncJob, deps Deps, log *zap.Logger) (int64, error) {
+	file, err := deps.FileRepo.GetByID(ctx, job.FileID)
+	if err != nil {
+		return 0, fmt.Errorf("download: get file metadata: %w", err)
+	}
+	if !file.CloudSynced || file.CloudKey == "" {
+		return 0, fmt.Errorf("download: file %s has no cloud object to recall", file.ID)
+	}
+
+	ns, err := deps.NSRepo.GetByID(ctx, job.NamespaceID)
+	if err != nil {
+		return 0, fmt.Errorf("download: get namespace: %w", err)
+	}
+
+	log.Info("downloading file from cloud",
+		zap.String("cloud_key", file.CloudKey),
+		zap.String("bucket", ns.CloudBucket),
+	)
+
+	out, err := deps.Provider.Download(ctx, ns.CloudBucket, file.CloudKey)
+	if err != nil {
+		return 0, fmt.Errorf("download: cloud provider download: %w", err)
+	}
+	defer out.Body.Close()
+
+	// TODO: replace io.Discard with os.Create(filepath.Join(nfsMountPath, file.Path))
+	//       and stream out.Body into the local file once the NFS mount is wired.
+	n, err := io.Copy(io.Discard, out.Body)
+	if err != nil {
+		return 0, fmt.Errorf("download: drain response body: %w", err)
+	}
+
+	if err := deps.FileRepo.UpdateTier(ctx, job.FileID, string(models.TierHot)); err != nil {
+		return 0, fmt.Errorf("download: update tier to hot: %w", err)
+	}
+
+	log.Info("file recalled to hot tier", zap.Int64("bytes", n))
+	return n, nil
+}
+
+// execTierMove changes a file's storage class within cloud (e.g. Standard → Glacier)
+// and updates the tier field in the DB. The progression is always hot→warm or warm→cold.
+func execTierMove(ctx context.Context, job *models.SyncJob, deps Deps, log *zap.Logger) error {
+	file, err := deps.FileRepo.GetByID(ctx, job.FileID)
+	if err != nil {
+		return fmt.Errorf("tier_move: get file: %w", err)
+	}
+
+	var targetTier models.TierType
+	switch file.Tier {
+	case models.TierHot:
+		targetTier = models.TierWarm
+	case models.TierWarm:
+		targetTier = models.TierCold
+	default:
+		return fmt.Errorf("tier_move: file is already at terminal tier %q", file.Tier)
+	}
+
+	log.Info("moving file to colder tier",
+		zap.String("from", string(file.Tier)),
+		zap.String("to", string(targetTier)),
+	)
+
+	// TODO: issue a cloud-side CopyObject with the new storage class
+	// (S3: StorageClass=STANDARD_IA for warm, GLACIER for cold) before updating DB.
+	// This requires a Provider.CopyObject method — defer to Phase 2.
+
+	if err := deps.FileRepo.UpdateTier(ctx, job.FileID, string(targetTier)); err != nil {
+		return fmt.Errorf("tier_move: update tier in DB: %w", err)
+	}
+	return nil
+}
+
+// execDelete removes the file's cloud object and clears the cloud_synced flag in the DB.
+func execDelete(ctx context.Context, job *models.SyncJob, deps Deps, log *zap.Logger) error {
+	file, err := deps.FileRepo.GetByID(ctx, job.FileID)
+	if err != nil {
+		return fmt.Errorf("delete: get file: %w", err)
+	}
+
+	if !file.CloudSynced || file.CloudKey == "" {
+		log.Info("delete: file has no cloud object, skipping provider call")
+		return nil
+	}
+
+	ns, err := deps.NSRepo.GetByID(ctx, job.NamespaceID)
+	if err != nil {
+		return fmt.Errorf("delete: get namespace: %w", err)
+	}
+
+	log.Info("deleting cloud object",
+		zap.String("cloud_key", file.CloudKey),
+		zap.String("bucket", ns.CloudBucket),
+	)
+
+	if err := deps.Provider.Delete(ctx, ns.CloudBucket, file.CloudKey); err != nil {
+		return fmt.Errorf("delete: cloud provider delete: %w", err)
+	}
+
+	if err := deps.FileRepo.UpdateCloudSync(ctx, job.FileID, ""); err != nil {
+		return fmt.Errorf("delete: clear cloud_synced flag: %w", err)
+	}
+
+	log.Info("cloud object deleted")
+	return nil
+}
+
+// buildCloudKey constructs the object key for a file in cloud storage.
+// Format: [prefix/]<namespaceID>/<filePath>
+func buildCloudKey(prefix, namespaceID, filePath string) string {
+	if prefix == "" {
+		return fmt.Sprintf("%s/%s", namespaceID, filePath)
+	}
+	return fmt.Sprintf("%s/%s/%s", strings.TrimRight(prefix, "/"), namespaceID, filePath)
 }

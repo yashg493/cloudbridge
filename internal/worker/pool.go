@@ -3,114 +3,181 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/yashg493/cloudbridge/internal/cloud"
+	"github.com/yashg493/cloudbridge/internal/metrics"
+	"github.com/yashg493/cloudbridge/internal/models"
+	"github.com/yashg493/cloudbridge/internal/store"
 )
 
-// ErrQueueFull is returned by Submit when the job queue has reached capacity.
-var ErrQueueFull = errors.New("worker: job queue is full")
+// ErrPoolFull is returned by Submit when the job channel is at capacity.
+var ErrPoolFull = errors.New("worker: pool job queue is full")
 
-// Job is the unit of work executed by the pool.
-// Implementations must be idempotent where possible (worker may retry on transient errors).
-type Job interface {
-	// Execute performs the work. Receives the pool's context; honour cancellation.
-	Execute(ctx context.Context) error
-	// ID returns a stable unique identifier used for logging and deduplication.
-	ID() string
-	// Type returns a short human-readable label (e.g. "tier_up", "tier_down").
-	Type() string
+// Deps bundles every external dependency required by ProcessJob.
+// Construct one value and pass it to NewWorkerPool; it is propagated to
+// every job execution without further allocation.
+type Deps struct {
+	FileRepo    *store.FileRepo
+	NSRepo      *store.NamespaceRepo
+	SyncJobRepo *store.SyncJobRepo
+	Provider    cloud.Provider
+	Metrics     *metrics.Registry
+	Logger      *zap.Logger
 }
 
-// Pool is a fixed-size goroutine pool that processes Jobs from a bounded channel.
-// Callers submit jobs via Submit; the pool fans them out across worker goroutines.
-// All workers share the same context; cancelling it triggers a graceful drain.
-type Pool struct {
-	workers    int
-	jobQueue   chan Job
-	wg         sync.WaitGroup
-	logger     *zap.Logger
-	ctx        context.Context
-	cancelFunc context.CancelFunc
+// WorkerPool is a bounded, concurrent pool that processes *models.SyncJob records
+// pulled from a buffered channel. Jobs are sourced by the Scheduler from the
+// database and handed to the pool via Submit.
+type WorkerPool struct {
+	size          int
+	jobChan       chan *models.SyncJob
+	wg            sync.WaitGroup
+	activeWorkers atomic.Int32
+	ctx           context.Context
+	cancel        context.CancelFunc
+	deps          Deps
+	mu            sync.Mutex // protects closed
+	closed        bool
 }
 
-// NewPool creates a Pool with the given number of goroutines and queue depth.
-// Call Start to launch the workers; call Stop to drain and shut down.
-func NewPool(ctx context.Context, workers, queueSize int, logger *zap.Logger) *Pool {
+// NewWorkerPool creates a WorkerPool with size goroutines.
+// The internal channel is buffered at size×10 to absorb submission bursts.
+// Call Start() to launch workers and Submit() to enqueue jobs.
+func NewWorkerPool(ctx context.Context, size int, deps Deps) *WorkerPool {
 	poolCtx, cancel := context.WithCancel(ctx)
-	return &Pool{
-		workers:    workers,
-		jobQueue:   make(chan Job, queueSize),
-		logger:     logger,
-		ctx:        poolCtx,
-		cancelFunc: cancel,
+	return &WorkerPool{
+		size:    size,
+		jobChan: make(chan *models.SyncJob, size*10),
+		ctx:     poolCtx,
+		cancel:  cancel,
+		deps:    deps,
 	}
 }
 
-// Start spawns all worker goroutines. Must be called exactly once before Submit.
-func (p *Pool) Start() {
-	for i := range p.workers {
-		p.wg.Add(1)
-		go p.runWorker(i)
+// Start spawns size worker goroutines. Must be called exactly once before Submit.
+func (wp *WorkerPool) Start() {
+	for i := range wp.size {
+		wp.wg.Add(1)
+		go wp.workerLoop(i)
 	}
-	p.logger.Info("worker pool started", zap.Int("workers", p.workers), zap.Int("queue_cap", cap(p.jobQueue)))
+	wp.deps.Logger.Info("worker pool started",
+		zap.Int("size", wp.size),
+		zap.Int("queue_cap", cap(wp.jobChan)),
+	)
 }
 
-// Submit enqueues a job for execution. Returns ErrQueueFull immediately if the
-// channel is at capacity (non-blocking to avoid back-pressure on HTTP handlers).
-func (p *Pool) Submit(job Job) error {
+// Submit enqueues job for asynchronous processing.
+// Non-blocking: returns ErrPoolFull immediately if the channel is at capacity
+// so HTTP handlers are never stalled. Returns an error if the pool is shutting down.
+func (wp *WorkerPool) Submit(job *models.SyncJob) error {
+	wp.mu.Lock()
+	defer wp.mu.Unlock()
+
+	if wp.closed {
+		return fmt.Errorf("worker: pool is shutting down")
+	}
+
 	select {
-	case p.jobQueue <- job:
-		// TODO: increment WorkerQueueDepth metric
-		p.logger.Debug("job enqueued", zap.String("job_id", job.ID()), zap.String("type", job.Type()))
+	case wp.jobChan <- job:
+		if wp.deps.Metrics != nil {
+			wp.deps.Metrics.WorkerQueueDepth.Set(float64(len(wp.jobChan)))
+		}
 		return nil
 	default:
-		p.logger.Warn("job queue full, dropping job",
-			zap.String("job_id", job.ID()),
-			zap.String("type", job.Type()),
-		)
-		// TODO: increment dropped_jobs_total metric
-		return ErrQueueFull
+		if wp.deps.Metrics != nil {
+			wp.deps.Metrics.WorkerJobsTotal.WithLabelValues(string(job.Operation), "dropped").Inc()
+		}
+		return ErrPoolFull
 	}
 }
 
-// Stop signals the workers to stop, drains all queued jobs, and waits for
-// in-flight jobs to finish. Safe to call multiple times.
-func (p *Pool) Stop() {
-	p.cancelFunc()      // signal workers to stop accepting new jobs
-	close(p.jobQueue)   // drain: workers finish remaining jobs then exit
-	p.wg.Wait()
-	p.logger.Info("worker pool stopped")
+// Shutdown gracefully stops the pool:
+//  1. Closes the job channel (no new jobs accepted; Submit returns an error).
+//  2. Lets in-flight and remaining-queued jobs complete.
+//  3. Returns ctx.Err() if the provided context expires before workers finish.
+func (wp *WorkerPool) Shutdown(ctx context.Context) error {
+	wp.mu.Lock()
+	if wp.closed {
+		wp.mu.Unlock()
+		return nil
+	}
+	wp.closed = true
+	close(wp.jobChan) // workers range over the channel and drain remaining jobs
+	wp.mu.Unlock()
+
+	wp.cancel() // cancel pool context so in-flight ops can detect shutdown
+
+	done := make(chan struct{})
+	go func() { wp.wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+		wp.deps.Logger.Info("worker pool stopped cleanly")
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("worker pool shutdown timed out: %w", ctx.Err())
+	}
 }
 
-// runWorker is the per-goroutine event loop. It processes jobs until the channel
-// is closed or the pool context is cancelled.
-func (p *Pool) runWorker(id int) {
-	defer p.wg.Done()
-	p.logger.Debug("worker started", zap.Int("worker_id", id))
+// ActiveWorkers returns the number of goroutines currently executing a job.
+func (wp *WorkerPool) ActiveWorkers() int32 {
+	return wp.activeWorkers.Load()
+}
 
-	for job := range p.jobQueue {
-		// TODO: decrement WorkerQueueDepth metric
-		p.logger.Debug("executing job",
-			zap.Int("worker_id", id),
-			zap.String("job_id", job.ID()),
-			zap.String("type", job.Type()),
+// workerLoop is the per-goroutine event loop. It ranges over jobChan until
+// the channel is closed by Shutdown, then exits and signals wg.Done.
+func (wp *WorkerPool) workerLoop(workerID int) {
+	defer wp.wg.Done()
+	wp.activeWorkers.Add(1)
+	defer wp.activeWorkers.Add(-1)
+
+	wp.deps.Logger.Debug("worker started", zap.Int("worker_id", workerID))
+
+	for job := range wp.jobChan {
+		if wp.deps.Metrics != nil {
+			wp.deps.Metrics.WorkerQueueDepth.Set(float64(len(wp.jobChan)))
+		}
+
+		start := time.Now()
+		log := wp.deps.Logger.With(
+			zap.Int("worker_id", workerID),
+			zap.String("job_id", job.ID.String()),
+			zap.String("operation", string(job.Operation)),
 		)
+		log.Debug("processing job")
 
-		// TODO: wrap Execute with a per-job timeout derived from p.ctx
-		// TODO: record WorkerJobDuration histogram
-		if err := job.Execute(p.ctx); err != nil {
-			p.logger.Error("job execution failed",
-				zap.Int("worker_id", id),
-				zap.String("job_id", job.ID()),
-				zap.String("type", job.Type()),
+		err := ProcessJob(wp.ctx, job, wp.deps)
+
+		elapsed := time.Since(start)
+		if wp.deps.Metrics != nil {
+			wp.deps.Metrics.WorkerJobDuration.
+				WithLabelValues(string(job.Operation)).
+				Observe(elapsed.Seconds())
+		}
+
+		if err != nil {
+			log.Error("job permanently failed",
+				zap.Duration("elapsed", elapsed),
 				zap.Error(err),
 			)
-			// TODO: increment WorkerJobsTotal{type, "failed"}
+			if wp.deps.Metrics != nil {
+				wp.deps.Metrics.WorkerJobsTotal.
+					WithLabelValues(string(job.Operation), "failed").Inc()
+			}
 		} else {
-			// TODO: increment WorkerJobsTotal{type, "completed"}
+			log.Debug("job completed", zap.Duration("elapsed", elapsed))
+			if wp.deps.Metrics != nil {
+				wp.deps.Metrics.WorkerJobsTotal.
+					WithLabelValues(string(job.Operation), "completed").Inc()
+			}
 		}
 	}
 
-	p.logger.Debug("worker stopped", zap.Int("worker_id", id))
+	wp.deps.Logger.Debug("worker stopped", zap.Int("worker_id", workerID))
 }

@@ -50,7 +50,7 @@ func run(ctx context.Context, logger *zap.Logger) error {
 	)
 
 	workerCount, _ := strconv.Atoi(getEnv("WORKER_COUNT", "10"))
-	workerQueueSize, _ := strconv.Atoi(getEnv("WORKER_QUEUE_SIZE", "100"))
+	// WORKER_QUEUE_SIZE is reserved for future configuration; pool uses size×10 internally.
 
 	// ── Database ─────────────────────────────────────────────────────────────
 	// TODO: uncomment when Postgres is reachable from the local environment.
@@ -66,25 +66,41 @@ func run(ctx context.Context, logger *zap.Logger) error {
 	// ── Repositories ─────────────────────────────────────────────────────────
 	fileRepo := store.NewFileRepo(pool)
 	nsRepo := store.NewNamespaceRepo(pool)
+	syncJobRepo := store.NewSyncJobRepo(pool)
 
-	// ── Cloud provider ───────────────────────────────────────────────────────
+	// ── Cloud provider ─────────────────────────────────────────────────────────────
 	// TODO: select provider from CLOUD_PROVIDER env var (s3 | gcs)
 	// TODO: cloud.NewS3Provider(ctx, s3Cfg, logger) or cloud.NewGCSProvider(...)
 	// var provider cloud.Provider
 
-	// ── Metrics ──────────────────────────────────────────────────────────────
+	// ── Metrics ────────────────────────────────────────────────────────────────
 	metricsReg := metrics.NewRegistry()
-	_ = metricsReg // injected into router when middleware is wired
 
-	// ── Worker pool ──────────────────────────────────────────────────────────
-	workerPool := worker.NewPool(ctx, workerCount, workerQueueSize, logger)
+	// ── Worker pool ─────────────────────────────────────────────────────────────
+	workerDeps := worker.Deps{
+		FileRepo:    fileRepo,
+		NSRepo:      nsRepo,
+		SyncJobRepo: syncJobRepo,
+		Provider:    nil, // TODO: wire cloud provider once S3 is implemented
+		Metrics:     metricsReg,
+		Logger:      logger,
+	}
+	workerPool := worker.NewWorkerPool(ctx, workerCount, workerDeps)
 	workerPool.Start()
-	defer workerPool.Stop()
+	defer func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutCancel()
+		if err := workerPool.Shutdown(shutCtx); err != nil {
+			logger.Error("worker pool shutdown error", zap.Error(err))
+		}
+	}()
 
-	// ── Tiering scheduler ────────────────────────────────────────────────────
-	// TODO: uncomment once provider and fileRepo are fully implemented.
-	// scheduler := worker.NewScheduler(pool, fileRepo, provider, logger, 5*time.Minute)
-	// go scheduler.Run(ctx)
+	// ── Job scheduler ───────────────────────────────────────────────────────────
+	// NOTE: the scheduler polls the DB for pending jobs. It is a no-op when
+	//       syncJobRepo has no backing pool (pool == nil).
+	scheduler := worker.NewScheduler(workerPool, syncJobRepo, logger)
+	scheduler.Start()
+	defer scheduler.Stop()
 
 	// ── HTTP server ──────────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
