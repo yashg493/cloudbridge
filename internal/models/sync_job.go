@@ -6,36 +6,39 @@ import (
 	"github.com/google/uuid"
 )
 
-// SyncJobType classifies the background work a sync job performs.
-type SyncJobType string
+// SyncOperation classifies the cloud/file operation performed by a sync job.
+type SyncOperation string
 
 const (
-	SyncJobTypeTierUp    SyncJobType = "tier_up"    // move file hot→warm or warm→cold
-	SyncJobTypeTierDown  SyncJobType = "tier_down"  // recall file cold/warm→hot
-	SyncJobTypeReplicate SyncJobType = "replicate"  // cross-region replication
-	SyncJobTypeDelete    SyncJobType = "delete"     // remove cloud object after soft-delete
+	SyncOperationUpload   SyncOperation = "upload"
+	SyncOperationDownload SyncOperation = "download"
+	SyncOperationDelete   SyncOperation = "delete"
+	SyncOperationTierMove SyncOperation = "tier_move"
 )
 
-// SyncJobStatus tracks the execution state of a sync job.
-type SyncJobStatus string
+// SyncStatus tracks the execution lifecycle of a sync job.
+type SyncStatus string
 
 const (
-	SyncJobStatusPending   SyncJobStatus = "pending"
-	SyncJobStatusRunning   SyncJobStatus = "running"
-	SyncJobStatusCompleted SyncJobStatus = "completed"
-	SyncJobStatusFailed    SyncJobStatus = "failed"
+	SyncStatusPending   SyncStatus = "pending"
+	SyncStatusQueued    SyncStatus = "queued"
+	SyncStatusRunning   SyncStatus = "running"
+	SyncStatusCompleted SyncStatus = "completed"
+	SyncStatusFailed    SyncStatus = "failed"
+	SyncStatusCancelled SyncStatus = "cancelled"
 )
 
-// SyncJob represents a single unit of background work queued for the worker pool.
+// SyncJob tracks file replication and tiering operations.
 type SyncJob struct {
-	ID          uuid.UUID     `json:"id"                    db:"id"`
-	FileID      uuid.UUID     `json:"file_id"               db:"file_id"`
-	Type        SyncJobType   `json:"type"                  db:"type"`
-	Status      SyncJobStatus `json:"status"                db:"status"`
-	Attempts    int           `json:"attempts"              db:"attempts"`
-	ErrorMsg    *string       `json:"error_msg,omitempty"   db:"error_msg"`
-	ScheduledAt time.Time     `json:"scheduled_at"          db:"scheduled_at"`
-	StartedAt   *time.Time    `json:"started_at,omitempty"  db:"started_at"`
-	CompletedAt *time.Time    `json:"completed_at,omitempty" db:"completed_at"`
-	CreatedAt   time.Time     `json:"created_at"            db:"created_at"`
+	ID               uuid.UUID     `json:"id"                db:"id"`
+	NamespaceID      uuid.UUID     `json:"namespace_id"      db:"namespace_id"`
+	FileID           uuid.UUID     `json:"file_id"           db:"file_id"`
+	Operation        SyncOperation `json:"operation"         db:"operation"`
+	Status           SyncStatus    `json:"status"            db:"status"`
+	RetryCount       int           `json:"retry_count"       db:"retry_count"`
+	ErrorMessage     string        `json:"error_message"     db:"error_message"`
+	BytesTransferred int64         `json:"bytes_transferred" db:"bytes_transferred"`
+	StartedAt        *time.Time    `json:"started_at"        db:"started_at"`
+	CompletedAt      *time.Time    `json:"completed_at"      db:"completed_at"`
+	CreatedAt        time.Time     `json:"created_at"        db:"created_at"`
 }

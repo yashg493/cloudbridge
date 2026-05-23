@@ -98,7 +98,7 @@ func (j *SyncJob) Execute(ctx context.Context) error {
 		//   1. j.provider.Download(ctx, bucket, *file.CloudKey)
 		//   2. write bytes to NFS path
 		//   3. j.fileRepo.UpdateTier(ctx, file.ID, models.TierHot, nil)
-		log.Info("tier-down: recalling from cloud", zap.Stringp("cloud_key", file.CloudKey))
+		log.Info("tier-down: recalling from cloud", zap.String("cloud_key", file.CloudKey))
 		return fmt.Errorf("sync_job %s: tier-down not implemented", j.id)
 
 	default:
