@@ -1,133 +1,228 @@
 package nfs
 
 import (
-	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"go.uber.org/zap"
-
-	"github.com/yashg493/cloudbridge/internal/models"
-	"github.com/yashg493/cloudbridge/internal/store"
 )
 
-// OpType identifies an NFS v3/v4 procedure being simulated.
-type OpType string
+const defaultBasePath = "/tmp/cloudbridge-nfs"
 
-const (
-	OpRead    OpType = "READ"
-	OpWrite   OpType = "WRITE"
-	OpCreate  OpType = "CREATE"
-	OpDelete  OpType = "DELETE"
-	OpLookup  OpType = "LOOKUP"
-	OpGetAttr OpType = "GETATTR"
-	OpSetAttr OpType = "SETATTR"
-)
-
-// Operation describes a single simulated NFS call.
-type Operation struct {
-	Type      OpType
-	Namespace string // namespace name or mount path
-	Path      string // file path relative to namespace root
-	SizeBytes int64  // relevant for WRITE / READ
-	Offset    int64  // byte offset for READ / WRITE
+// FileInfo holds metadata for a single file in the simulated NFS mount.
+type FileInfo struct {
+	Path      string    // path relative to the simulator's BasePath
+	SizeBytes int64
+	ModTime   time.Time
+	Checksum  string // SHA-256 hex digest
 }
 
-// Result is the outcome of a simulated NFS operation.
-type Result struct {
-	Success   bool
-	BytesOps  int64  // bytes read or written
-	FileID    string // set on CREATE / LOOKUP success
-	Error     error
-}
-
-// Simulator dispatches simulated NFS operations against the metadata and file store.
-// It does NOT perform real I/O; it updates metadata and triggers tiering recalls
-// as needed, making it useful for load simulation and integration testing.
+// Simulator simulates an NFS mount point using the local filesystem.
+// In production this would be replaced by a real NFS kernel module or driver.
+// All paths are relative to BasePath and are guarded against directory traversal.
 type Simulator struct {
-	fileRepo *store.FileRepo
-	nsRepo   *store.NamespaceRepo
+	BasePath string
 	logger   *zap.Logger
 }
 
-// NewSimulator creates a Simulator backed by the given repositories.
-func NewSimulator(
-	fileRepo *store.FileRepo,
-	nsRepo *store.NamespaceRepo,
-	logger *zap.Logger,
-) *Simulator {
-	return &Simulator{fileRepo: fileRepo, nsRepo: nsRepo, logger: logger}
+// New creates a Simulator rooted at basePath.
+// If basePath is empty, /tmp/cloudbridge-nfs is used.
+// The directory is created (with all parents) if it does not exist.
+func New(basePath string, logger *zap.Logger) (*Simulator, error) {
+	if basePath == "" {
+		basePath = defaultBasePath
+	}
+	if err := os.MkdirAll(basePath, 0o755); err != nil {
+		return nil, fmt.Errorf("nfs: create base path %q: %w", basePath, err)
+	}
+	logger.Info("NFS simulator initialised", zap.String("base_path", basePath))
+	return &Simulator{BasePath: basePath, logger: logger}, nil
 }
 
-// Execute dispatches op to the appropriate handler method.
-// Emits nfs_operations_total and nfs_latency_seconds metrics on return.
-func (s *Simulator) Execute(ctx context.Context, op Operation) Result {
-	// TODO: start timer for nfs_latency_seconds histogram
-	s.logger.Debug("nfs op",
-		zap.String("type", string(op.Type)),
-		zap.String("namespace", op.Namespace),
-		zap.String("path", op.Path),
-	)
+// fullPath resolves a relative path against BasePath and rejects traversal attempts.
+func (s *Simulator) fullPath(relPath string) (string, error) {
+	abs := filepath.Clean(filepath.Join(s.BasePath, relPath))
+	// Ensure the result is still under BasePath.
+	rel, err := filepath.Rel(s.BasePath, abs)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("nfs: path %q escapes base directory", relPath)
+	}
+	return abs, nil
+}
 
-	var result Result
-	switch op.Type {
-	case OpRead:
-		result = s.read(ctx, op)
-	case OpWrite:
-		result = s.write(ctx, op)
-	case OpCreate:
-		result = s.create(ctx, op)
-	case OpDelete:
-		result = s.delete(ctx, op)
-	case OpLookup:
-		result = s.lookup(ctx, op)
-	case OpGetAttr, OpSetAttr:
-		// TODO: implement attribute operations
-		result = Result{Error: fmt.Errorf("nfs: %s not implemented", op.Type)}
-	default:
-		result = Result{Error: fmt.Errorf("nfs: unknown op type %q", op.Type)}
+// ReadFile reads the entire file at path and returns its contents, byte count,
+// SHA-256 hex checksum, and any error.
+func (s *Simulator) ReadFile(path string) ([]byte, int64, string, error) {
+	start := time.Now()
+
+	full, err := s.fullPath(path)
+	if err != nil {
+		return nil, 0, "", err
 	}
 
-	// TODO: record nfs_operations_total{op_type, status} metric
-	// TODO: record nfs_latency_seconds histogram observation
-	return result
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("nfs: read %q: %w", path, err)
+	}
+
+	sum := sha256.Sum256(data)
+	checksum := hex.EncodeToString(sum[:])
+	size := int64(len(data))
+
+	s.logger.Debug("nfs: ReadFile",
+		zap.String("path", path),
+		zap.Int64("size_bytes", size),
+		zap.String("checksum", checksum),
+		zap.Duration("duration", time.Since(start)),
+	)
+	return data, size, checksum, nil
 }
 
-// read simulates an NFS READ RPC.
-func (s *Simulator) read(ctx context.Context, op Operation) Result {
-	// TODO: resolve file by namespace + path via s.fileRepo
-	// TODO: if file.Tier != hot, submit a tier-down recall job and return a
-	//       synthetic "recall in progress" error (NFS3ERR_JUKEBOX equivalent)
-	// TODO: fire-and-forget s.fileRepo.TouchAccessedAt to update heat tracking
-	// TODO: return simulated bytes (min(op.SizeBytes, file.SizeBytes - op.Offset))
-	_ = models.TierHot // used once tier-check logic is wired in
-	return Result{Error: fmt.Errorf("nfs: READ not implemented")}
+// WriteFile writes data to path, creating parent directories as needed.
+// Existing files are overwritten atomically via a temp-file + rename pattern.
+func (s *Simulator) WriteFile(path string, data []byte) error {
+	start := time.Now()
+
+	full, err := s.fullPath(path)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return fmt.Errorf("nfs: mkdir for %q: %w", path, err)
+	}
+
+	// Write to a temp file in the same directory so the rename is atomic.
+	tmp, err := os.CreateTemp(filepath.Dir(full), ".tmp-cloudbridge-*")
+	if err != nil {
+		return fmt.Errorf("nfs: create temp file for %q: %w", path, err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		// Best-effort cleanup; rename below may succeed before this runs.
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("nfs: write temp file for %q: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("nfs: close temp file for %q: %w", path, err)
+	}
+
+	if err := os.Rename(tmpName, full); err != nil {
+		return fmt.Errorf("nfs: rename to %q: %w", path, err)
+	}
+
+	s.logger.Debug("nfs: WriteFile",
+		zap.String("path", path),
+		zap.Int("size_bytes", len(data)),
+		zap.Duration("duration", time.Since(start)),
+	)
+	return nil
 }
 
-// write simulates an NFS WRITE RPC.
-func (s *Simulator) write(ctx context.Context, op Operation) Result {
-	// TODO: resolve or create file record
-	// TODO: update file.SizeBytes, file.UpdatedAt
-	// TODO: return BytesOps = op.SizeBytes
-	return Result{Error: fmt.Errorf("nfs: WRITE not implemented")}
+// DeleteFile removes the file at path. Returns nil if the file does not exist.
+func (s *Simulator) DeleteFile(path string) error {
+	full, err := s.fullPath(path)
+	if err != nil {
+		return err
+	}
+
+	if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("nfs: delete %q: %w", path, err)
+	}
+	s.logger.Debug("nfs: DeleteFile", zap.String("path", path))
+	return nil
 }
 
-// create simulates an NFS CREATE RPC.
-func (s *Simulator) create(ctx context.Context, op Operation) Result {
-	// TODO: resolve namespace, generate UUID, call s.fileRepo.Create
-	// TODO: return FileID = new UUID string
-	return Result{Error: fmt.Errorf("nfs: CREATE not implemented")}
+// ListFiles returns metadata for all regular files directly inside dirPath.
+// Checksums are not computed during listing (call Stat for per-file checksums).
+func (s *Simulator) ListFiles(dirPath string) ([]FileInfo, error) {
+	start := time.Now()
+
+	full, err := s.fullPath(dirPath)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(full)
+	if err != nil {
+		return nil, fmt.Errorf("nfs: readdir %q: %w", dirPath, err)
+	}
+
+	files := make([]FileInfo, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue // skip unreadable entries
+		}
+		files = append(files, FileInfo{
+			Path:      filepath.Join(dirPath, entry.Name()),
+			SizeBytes: info.Size(),
+			ModTime:   info.ModTime(),
+			// Checksum omitted — too expensive on large directories.
+		})
+	}
+
+	s.logger.Debug("nfs: ListFiles",
+		zap.String("dir", dirPath),
+		zap.Int("count", len(files)),
+		zap.Duration("duration", time.Since(start)),
+	)
+	return files, nil
 }
 
-// delete simulates an NFS REMOVE RPC.
-func (s *Simulator) delete(ctx context.Context, op Operation) Result {
-	// TODO: resolve file, call s.fileRepo.Delete (soft-delete)
-	// TODO: if file.Tier != hot, enqueue cloud delete job
-	return Result{Error: fmt.Errorf("nfs: DELETE not implemented")}
-}
+// Stat returns full metadata (including SHA-256 checksum) for the file at path.
+// Returns an error if the path is a directory or does not exist.
+func (s *Simulator) Stat(path string) (*FileInfo, error) {
+	start := time.Now()
 
-// lookup simulates an NFS LOOKUP RPC.
-func (s *Simulator) lookup(ctx context.Context, op Operation) Result {
-	// TODO: resolve namespace, query file by path
-	// TODO: return FileID if found, else NFS3ERR_NOENT equivalent
-	return Result{Error: fmt.Errorf("nfs: LOOKUP not implemented")}
+	full, err := s.fullPath(path)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := os.Stat(full)
+	if err != nil {
+		return nil, fmt.Errorf("nfs: stat %q: %w", path, err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("nfs: %q is a directory, not a file", path)
+	}
+
+	// Compute SHA-256 checksum by streaming the file.
+	f, err := os.Open(full)
+	if err != nil {
+		return nil, fmt.Errorf("nfs: open for checksum %q: %w", path, err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, fmt.Errorf("nfs: compute checksum %q: %w", path, err)
+	}
+
+	s.logger.Debug("nfs: Stat",
+		zap.String("path", path),
+		zap.Int64("size_bytes", info.Size()),
+		zap.Duration("duration", time.Since(start)),
+	)
+
+	return &FileInfo{
+		Path:      path,
+		SizeBytes: info.Size(),
+		ModTime:   info.ModTime(),
+		Checksum:  hex.EncodeToString(h.Sum(nil)),
+	}, nil
 }

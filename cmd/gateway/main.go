@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/yashg493/cloudbridge/internal/api"
+	"github.com/yashg493/cloudbridge/internal/cloud"
 	"github.com/yashg493/cloudbridge/internal/metrics"
 	"github.com/yashg493/cloudbridge/internal/store"
 	"github.com/yashg493/cloudbridge/internal/worker"
@@ -69,9 +70,8 @@ func run(ctx context.Context, logger *zap.Logger) error {
 	syncJobRepo := store.NewSyncJobRepo(pool)
 
 	// ── Cloud provider ─────────────────────────────────────────────────────────────
-	// TODO: select provider from CLOUD_PROVIDER env var (s3 | gcs)
-	// TODO: cloud.NewS3Provider(ctx, s3Cfg, logger) or cloud.NewGCSProvider(...)
-	// var provider cloud.Provider
+	// Returns S3Provider when AWS_REGION + AWS_BUCKET are set; MockS3Provider otherwise.
+	cloudProvider := cloud.NewProvider(ctx, logger)
 
 	// ── Metrics ────────────────────────────────────────────────────────────────
 	metricsReg := metrics.NewRegistry()
@@ -81,7 +81,7 @@ func run(ctx context.Context, logger *zap.Logger) error {
 		FileRepo:    fileRepo,
 		NSRepo:      nsRepo,
 		SyncJobRepo: syncJobRepo,
-		Provider:    nil, // TODO: wire cloud provider once S3 is implemented
+		Provider:    cloudProvider,
 		Metrics:     metricsReg,
 		Logger:      logger,
 	}

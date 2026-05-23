@@ -9,7 +9,6 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/yashg493/cloudbridge/internal/cloud"
 	"github.com/yashg493/cloudbridge/internal/models"
 )
 
@@ -151,28 +150,15 @@ func execUpload(ctx context.Context, job *models.SyncJob, deps Deps, log *zap.Lo
 		zap.Int64("size_bytes", file.SizeBytes),
 	)
 
-	info, err := deps.Provider.Upload(ctx, cloud.UploadInput{
-		Bucket:      ns.CloudBucket,
-		Key:         cloudKey,
-		Body:        body,
-		ContentType: "application/octet-stream",
-		SizeBytes:   file.SizeBytes,
-		Metadata: map[string]string{
-			"namespace_id": job.NamespaceID.String(),
-			"file_id":      job.FileID.String(),
-			"path":         file.Path,
-			"checksum":     file.Checksum,
-		},
-	})
-	if err != nil {
+	if err := deps.Provider.Upload(ctx, cloudKey, body, file.SizeBytes); err != nil {
 		return 0, fmt.Errorf("upload: cloud provider upload: %w", err)
 	}
 
-	if err := deps.FileRepo.UpdateCloudSync(ctx, job.FileID, info.Key); err != nil {
+	if err := deps.FileRepo.UpdateCloudSync(ctx, job.FileID, cloudKey); err != nil {
 		return 0, fmt.Errorf("upload: persist cloud key: %w", err)
 	}
 
-	log.Info("file uploaded", zap.String("etag", info.ETag), zap.String("cloud_key", info.Key))
+	log.Info("file uploaded", zap.String("cloud_key", cloudKey))
 	return file.SizeBytes, nil
 }
 
@@ -187,25 +173,19 @@ func execDownload(ctx context.Context, job *models.SyncJob, deps Deps, log *zap.
 		return 0, fmt.Errorf("download: file %s has no cloud object to recall", file.ID)
 	}
 
-	ns, err := deps.NSRepo.GetByID(ctx, job.NamespaceID)
-	if err != nil {
-		return 0, fmt.Errorf("download: get namespace: %w", err)
-	}
-
 	log.Info("downloading file from cloud",
 		zap.String("cloud_key", file.CloudKey),
-		zap.String("bucket", ns.CloudBucket),
 	)
 
-	out, err := deps.Provider.Download(ctx, ns.CloudBucket, file.CloudKey)
+	body, err := deps.Provider.Download(ctx, file.CloudKey)
 	if err != nil {
 		return 0, fmt.Errorf("download: cloud provider download: %w", err)
 	}
-	defer out.Body.Close()
+	defer body.Close()
 
-	// TODO: replace io.Discard with os.Create(filepath.Join(nfsMountPath, file.Path))
-	//       and stream out.Body into the local file once the NFS mount is wired.
-	n, err := io.Copy(io.Discard, out.Body)
+	// TODO: replace io.Discard with nfs.Simulator.WriteFile(file.Path, data)
+	//       once the NFS simulator is wired into the Deps struct.
+	n, err := io.Copy(io.Discard, body)
 	if err != nil {
 		return 0, fmt.Errorf("download: drain response body: %w", err)
 	}
@@ -263,17 +243,11 @@ func execDelete(ctx context.Context, job *models.SyncJob, deps Deps, log *zap.Lo
 		return nil
 	}
 
-	ns, err := deps.NSRepo.GetByID(ctx, job.NamespaceID)
-	if err != nil {
-		return fmt.Errorf("delete: get namespace: %w", err)
-	}
-
 	log.Info("deleting cloud object",
 		zap.String("cloud_key", file.CloudKey),
-		zap.String("bucket", ns.CloudBucket),
 	)
 
-	if err := deps.Provider.Delete(ctx, ns.CloudBucket, file.CloudKey); err != nil {
+	if err := deps.Provider.Delete(ctx, file.CloudKey); err != nil {
 		return fmt.Errorf("delete: cloud provider delete: %w", err)
 	}
 

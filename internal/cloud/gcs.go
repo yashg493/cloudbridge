@@ -1,63 +1,38 @@
 package cloud
 
+// TODO: implement using cloud.google.com/go/storage
+// Implementation guide:
+//   - storage.NewClient(ctx, option.WithCredentialsFile(credentialsFile))
+//   - Upload:   wc := client.Bucket(bucket).Object(key).NewWriter(ctx); io.Copy(wc, data); wc.Close()
+//   - Download: r, _ := client.Bucket(bucket).Object(key).NewReader(ctx)
+//   - Delete:   client.Bucket(bucket).Object(key).Delete(ctx)
+//   - Exists:   _, err := client.Bucket(bucket).Object(key).Attrs(ctx); err == nil → exists
+//   - GetURL:   client.Bucket(bucket).Object(key).SignedURL(storage.SignedURLOptions{Expires: ...})
+
 import (
 	"context"
-	"fmt"
-
-	"go.uber.org/zap"
+	"io"
+	"time"
 )
 
-// GCSConfig holds Google Cloud Storage configuration.
-type GCSConfig struct {
-	ProjectID       string // GCP project ID
-	CredentialsFile string // path to service-account JSON; empty = use ADC
+// GCSProvider is a stub implementation of CloudProvider for Google Cloud Storage.
+// All methods return ErrNotImplemented until the GCS client is wired in.
+type GCSProvider struct{}
+
+// Compile-time assertion that GCSProvider satisfies CloudProvider.
+var _ CloudProvider = (*GCSProvider)(nil)
+
+func (g *GCSProvider) Upload(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return ErrNotImplemented
 }
-
-// GCSProvider implements Provider for Google Cloud Storage.
-// NOTE: This is a stub — all methods return ErrNotImplemented.
-//
-// Implementation guide:
-//   - import "cloud.google.com/go/storage" (add to go.mod when implementing)
-//   - NewGCSProvider: storage.NewClient(ctx, option.WithCredentialsFile(...))
-//   - Upload: wc := client.Bucket(b).Object(k).NewWriter(ctx); io.Copy(wc, body); wc.Close()
-//   - Download: client.Bucket(b).Object(k).NewReader(ctx)
-//   - Delete: client.Bucket(b).Object(k).Delete(ctx)
-//   - Exists: client.Bucket(b).Object(k).Attrs(ctx) — nil err == exists
-type GCSProvider struct {
-	cfg    GCSConfig
-	logger *zap.Logger
+func (g *GCSProvider) Download(_ context.Context, _ string) (io.ReadCloser, error) {
+	return nil, ErrNotImplemented
 }
-
-// Compile-time assertion that GCSProvider satisfies the Provider interface.
-var _ Provider = (*GCSProvider)(nil)
-
-// NewGCSProvider creates a GCSProvider stub. Logs a warning that GCS is unimplemented.
-func NewGCSProvider(_ context.Context, cfg GCSConfig, logger *zap.Logger) (*GCSProvider, error) {
-	logger.Warn("GCSProvider is a stub — operations will return errors until implemented",
-		zap.String("project_id", cfg.ProjectID),
-	)
-	return &GCSProvider{cfg: cfg, logger: logger}, nil
+func (g *GCSProvider) Delete(_ context.Context, _ string) error       { return ErrNotImplemented }
+func (g *GCSProvider) Exists(_ context.Context, _ string) (bool, error) {
+	return false, ErrNotImplemented
 }
-
-// Upload implements Provider.Upload (stub).
-func (p *GCSProvider) Upload(_ context.Context, _ UploadInput) (ObjectInfo, error) {
-	return ObjectInfo{}, fmt.Errorf("GCSProvider.Upload: not implemented")
+func (g *GCSProvider) GetURL(_ context.Context, _ string, _ time.Duration) (string, error) {
+	return "", ErrNotImplemented
 }
-
-// Download implements Provider.Download (stub).
-func (p *GCSProvider) Download(_ context.Context, _, _ string) (DownloadOutput, error) {
-	return DownloadOutput{}, fmt.Errorf("GCSProvider.Download: not implemented")
-}
-
-// Delete implements Provider.Delete (stub).
-func (p *GCSProvider) Delete(_ context.Context, _, _ string) error {
-	return fmt.Errorf("GCSProvider.Delete: not implemented")
-}
-
-// Exists implements Provider.Exists (stub).
-func (p *GCSProvider) Exists(_ context.Context, _, _ string) (bool, error) {
-	return false, fmt.Errorf("GCSProvider.Exists: not implemented")
-}
-
-// Name implements Provider.Name.
-func (p *GCSProvider) Name() string { return "gcs" }
+func (g *GCSProvider) Name() string { return "gcs" }

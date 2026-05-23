@@ -26,7 +26,7 @@ type Deps struct {
 	FileRepo    *store.FileRepo
 	NSRepo      *store.NamespaceRepo
 	SyncJobRepo *store.SyncJobRepo
-	Provider    cloud.Provider
+	Provider    cloud.CloudProvider
 	Metrics     *metrics.Registry
 	Logger      *zap.Logger
 }

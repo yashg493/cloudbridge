@@ -2,53 +2,36 @@ package cloud
 
 import (
 	"context"
+	"errors"
 	"io"
+	"time"
 )
 
-// UploadInput holds all parameters required to store an object in cloud storage.
-type UploadInput struct {
-	Bucket      string
-	Key         string            // object key / path within the bucket
-	Body        io.Reader         // byte stream; must be closed by the caller after Upload returns
-	ContentType string            // MIME type, e.g. "application/octet-stream"
-	SizeBytes   int64             // total content length; -1 if unknown (disables multipart size hint)
-	Metadata    map[string]string // provider-level object metadata (e.g. original file path)
-}
+// ErrNotImplemented is returned by cloud provider methods that are not yet built.
+var ErrNotImplemented = errors.New("cloud: operation not implemented")
 
-// DownloadOutput contains the result of a successful cloud object download.
-// The caller is responsible for closing Body.
-type DownloadOutput struct {
-	Body        io.ReadCloser
-	ContentType string
-	SizeBytes   int64
-	ETag        string // provider-assigned content hash
-}
+// CloudProvider is the abstraction over cloud object-storage backends.
+// The storage bucket is configured at provider construction time, so callers
+// only pass the object key. All implementations must be safe for concurrent use.
+type CloudProvider interface {
+	// Upload streams data to the cloud backend under key.
+	// sizeBytes is a hint for Content-Length; pass -1 if the size is unknown.
+	Upload(ctx context.Context, key string, data io.Reader, sizeBytes int64) error
 
-// ObjectInfo is returned on successful uploads and Exists checks.
-type ObjectInfo struct {
-	Key       string
-	Bucket    string
-	SizeBytes int64
-	ETag      string
-}
+	// Download opens a streaming read of the object at key.
+	// The caller must close the returned ReadCloser after consuming it.
+	Download(ctx context.Context, key string) (io.ReadCloser, error)
 
-// Provider is the abstraction layer over cloud object storage backends.
-// All implementations must be safe for concurrent use from multiple goroutines.
-type Provider interface {
-	// Upload streams object data to the cloud backend.
-	// For large objects, implementations should use multipart / resumable upload.
-	Upload(ctx context.Context, input UploadInput) (ObjectInfo, error)
+	// Delete permanently removes the object at key.
+	// Returns nil if the key does not exist.
+	Delete(ctx context.Context, key string) error
 
-	// Download opens a streaming download of the specified object.
-	// The caller must close DownloadOutput.Body when done reading.
-	Download(ctx context.Context, bucket, key string) (DownloadOutput, error)
+	// Exists reports whether an object with the given key is present.
+	Exists(ctx context.Context, key string) (bool, error)
 
-	// Delete permanently removes an object. Returns nil if the object did not exist.
-	Delete(ctx context.Context, bucket, key string) error
+	// GetURL generates a pre-signed URL granting time-limited read access to key.
+	GetURL(ctx context.Context, key string, expires time.Duration) (string, error)
 
-	// Exists checks whether an object is present without downloading it.
-	Exists(ctx context.Context, bucket, key string) (bool, error)
-
-	// Name returns the human-readable provider identifier (e.g. "s3", "gcs").
+	// Name returns the provider identifier (e.g. "s3", "gcs", "mock-s3").
 	Name() string
 }
