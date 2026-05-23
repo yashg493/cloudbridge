@@ -2,6 +2,7 @@ package api
 
 import (
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
@@ -15,9 +16,9 @@ import (
 // RouterConfig bundles all dependencies required to wire the HTTP routes.
 type RouterConfig struct {
 	Logger     *zap.Logger
-	DB         *store.DB
-	FileRepo   *store.FileRepository
-	NSRepo     *store.NamespaceRepository
+	Pool       *pgxpool.Pool
+	FileRepo   *store.FileRepo
+	NSRepo     *store.NamespaceRepo
 	WorkerPool *worker.Pool
 	MetricsReg *metrics.Registry
 }
@@ -34,7 +35,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	//       record cloudbridge_http_requests_total and cloudbridge_http_request_duration_seconds
 
 	// ── Observability endpoints ──────────────────────────────────────────────
-	healthHandler := handlers.NewHealthHandler(cfg.DB, cfg.Logger)
+	healthHandler := handlers.NewHealthHandler(cfg.Pool, cfg.Logger)
 	r.GET("/healthz", healthHandler.Liveness)
 	r.GET("/readyz", healthHandler.Readiness)
 	r.GET("/metrics", gin.WrapH(promhttp.Handler())) // Prometheus scrape endpoint

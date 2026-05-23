@@ -12,14 +12,14 @@ import (
 
 // FileHandler handles file CRUD and tiering endpoints.
 type FileHandler struct {
-	fileRepo   *store.FileRepository
+	fileRepo   *store.FileRepo
 	workerPool *worker.Pool
 	logger     *zap.Logger
 }
 
 // NewFileHandler creates a FileHandler.
 func NewFileHandler(
-	fileRepo *store.FileRepository,
+	fileRepo *store.FileRepo,
 	workerPool *worker.Pool,
 	logger *zap.Logger,
 ) *FileHandler {

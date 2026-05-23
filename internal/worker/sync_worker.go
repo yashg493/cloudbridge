@@ -16,10 +16,10 @@ import (
 // It is the primary way file data moves between hot (NFS) and warm/cold (cloud) tiers.
 type SyncJob struct {
 	id         string
-	jobType    string           // matches models.SyncJobType values
+	jobType    string // matches models.SyncOperation values
 	fileID     uuid.UUID
 	targetTier models.TierType
-	fileRepo   *store.FileRepository
+	fileRepo   *store.FileRepo
 	provider   cloud.Provider
 	logger     *zap.Logger
 }
@@ -27,12 +27,12 @@ type SyncJob struct {
 // Compile-time assertion that SyncJob satisfies the Job interface.
 var _ Job = (*SyncJob)(nil)
 
-// NewSyncJob constructs a SyncJob. jobType should be one of the SyncJobType constants.
+// NewSyncJob constructs a SyncJob. jobType should be one of the SyncOperation constants.
 func NewSyncJob(
 	fileID uuid.UUID,
 	targetTier models.TierType,
 	jobType string,
-	fileRepo *store.FileRepository,
+	fileRepo *store.FileRepo,
 	provider cloud.Provider,
 	logger *zap.Logger,
 ) *SyncJob {

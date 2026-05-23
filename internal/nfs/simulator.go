@@ -44,15 +44,15 @@ type Result struct {
 // It does NOT perform real I/O; it updates metadata and triggers tiering recalls
 // as needed, making it useful for load simulation and integration testing.
 type Simulator struct {
-	fileRepo *store.FileRepository
-	nsRepo   *store.NamespaceRepository
+	fileRepo *store.FileRepo
+	nsRepo   *store.NamespaceRepo
 	logger   *zap.Logger
 }
 
 // NewSimulator creates a Simulator backed by the given repositories.
 func NewSimulator(
-	fileRepo *store.FileRepository,
-	nsRepo *store.NamespaceRepository,
+	fileRepo *store.FileRepo,
+	nsRepo *store.NamespaceRepo,
 	logger *zap.Logger,
 ) *Simulator {
 	return &Simulator{fileRepo: fileRepo, nsRepo: nsRepo, logger: logger}

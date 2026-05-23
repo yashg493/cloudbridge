@@ -19,7 +19,7 @@ import (
 //   - warm → cold after warmThreshold of no access  (default 30 days)
 type Scheduler struct {
 	pool         *Pool
-	fileRepo     *store.FileRepository
+	fileRepo     *store.FileRepo
 	provider     cloud.Provider
 	logger       *zap.Logger
 	interval     time.Duration // how often to run the scan
@@ -30,7 +30,7 @@ type Scheduler struct {
 // NewScheduler creates a Scheduler with sensible default tier thresholds.
 func NewScheduler(
 	pool *Pool,
-	fileRepo *store.FileRepository,
+	fileRepo *store.FileRepo,
 	provider cloud.Provider,
 	logger *zap.Logger,
 	interval time.Duration,

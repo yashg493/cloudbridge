@@ -4,20 +4,19 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
-
-	"github.com/yashg493/cloudbridge/internal/store"
 )
 
 // HealthHandler serves Kubernetes liveness and readiness probes.
 type HealthHandler struct {
-	db     *store.DB
+	pool   *pgxpool.Pool
 	logger *zap.Logger
 }
 
 // NewHealthHandler creates a HealthHandler.
-func NewHealthHandler(db *store.DB, logger *zap.Logger) *HealthHandler {
-	return &HealthHandler{db: db, logger: logger}
+func NewHealthHandler(pool *pgxpool.Pool, logger *zap.Logger) *HealthHandler {
+	return &HealthHandler{pool: pool, logger: logger}
 }
 
 // Liveness handles GET /healthz.
@@ -34,8 +33,8 @@ func (h *HealthHandler) Readiness(c *gin.Context) {
 	healthy := true
 
 	// Database check
-	if h.db != nil {
-		if err := h.db.HealthCheck(c.Request.Context()); err != nil {
+	if h.pool != nil {
+		if err := h.pool.Ping(c.Request.Context()); err != nil {
 			h.logger.Warn("readiness: db check failed", zap.Error(err))
 			checks["database"] = err.Error()
 			healthy = false
@@ -43,7 +42,6 @@ func (h *HealthHandler) Readiness(c *gin.Context) {
 			checks["database"] = "ok"
 		}
 	} else {
-		// TODO: remove this branch once db is always initialised in main
 		checks["database"] = "not initialised"
 		healthy = false
 	}

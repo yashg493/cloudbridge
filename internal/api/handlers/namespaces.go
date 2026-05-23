@@ -11,12 +11,12 @@ import (
 
 // NamespaceHandler handles namespace (file share) CRUD endpoints.
 type NamespaceHandler struct {
-	nsRepo *store.NamespaceRepository
+	nsRepo *store.NamespaceRepo
 	logger *zap.Logger
 }
 
 // NewNamespaceHandler creates a NamespaceHandler.
-func NewNamespaceHandler(nsRepo *store.NamespaceRepository, logger *zap.Logger) *NamespaceHandler {
+func NewNamespaceHandler(nsRepo *store.NamespaceRepo, logger *zap.Logger) *NamespaceHandler {
 	return &NamespaceHandler{nsRepo: nsRepo, logger: logger}
 }
 

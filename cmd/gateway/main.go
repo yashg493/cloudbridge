@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"github.com/yashg493/cloudbridge/internal/api"
@@ -40,33 +41,31 @@ func main() {
 func run(ctx context.Context, logger *zap.Logger) error {
 	// ── Config from environment ──────────────────────────────────────────────
 	dbPort, _ := strconv.Atoi(getEnv("DB_PORT", "5432"))
-	dbCfg := store.Config{
-		Host:     getEnv("DB_HOST", "localhost"),
-		Port:     dbPort,
-		User:     getEnv("DB_USER", "cloudbridge"),
-		Password: getEnv("DB_PASSWORD", "cloudbridge"),
-		DBName:   getEnv("DB_NAME", "cloudbridge"),
-		MaxConns: 20,
-		MinConns: 2,
-	}
+	databaseURL := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		getEnv("DB_USER", "cloudbridge"),
+		getEnv("DB_PASSWORD", "cloudbridge"),
+		getEnv("DB_HOST", "localhost"),
+		dbPort,
+		getEnv("DB_NAME", "cloudbridge"),
+	)
 
 	workerCount, _ := strconv.Atoi(getEnv("WORKER_COUNT", "10"))
 	workerQueueSize, _ := strconv.Atoi(getEnv("WORKER_QUEUE_SIZE", "100"))
 
 	// ── Database ─────────────────────────────────────────────────────────────
-	// TODO: uncomment when Postgres is available in the target environment.
-	// db, err := store.New(ctx, dbCfg, logger)
+	// TODO: uncomment when Postgres is reachable from the local environment.
+	// pool, err := store.NewPool(ctx, databaseURL)
 	// if err != nil {
 	//     return fmt.Errorf("failed to connect to postgres: %w", err)
 	// }
-	// defer db.Close()
-	var db *store.DB // placeholder until DB is wired
-	_ = dbCfg
-	logger.Warn("database not yet initialised — set DB_* env vars and uncomment store.New in main.go")
+	// defer pool.Close()
+	var pool *pgxpool.Pool // placeholder until DB is wired
+	_ = databaseURL
+	logger.Warn("database not yet initialised — set DB_* env vars and uncomment store.NewPool in main.go")
 
 	// ── Repositories ─────────────────────────────────────────────────────────
-	fileRepo := store.NewFileRepository(db, logger)
-	nsRepo := store.NewNamespaceRepository(db, logger)
+	fileRepo := store.NewFileRepo(pool)
+	nsRepo := store.NewNamespaceRepo(pool)
 
 	// ── Cloud provider ───────────────────────────────────────────────────────
 	// TODO: select provider from CLOUD_PROVIDER env var (s3 | gcs)
@@ -78,9 +77,9 @@ func run(ctx context.Context, logger *zap.Logger) error {
 	_ = metricsReg // injected into router when middleware is wired
 
 	// ── Worker pool ──────────────────────────────────────────────────────────
-	pool := worker.NewPool(ctx, workerCount, workerQueueSize, logger)
-	pool.Start()
-	defer pool.Stop()
+	workerPool := worker.NewPool(ctx, workerCount, workerQueueSize, logger)
+	workerPool.Start()
+	defer workerPool.Stop()
 
 	// ── Tiering scheduler ────────────────────────────────────────────────────
 	// TODO: uncomment once provider and fileRepo are fully implemented.
@@ -90,10 +89,10 @@ func run(ctx context.Context, logger *zap.Logger) error {
 	// ── HTTP server ──────────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
 		Logger:     logger,
-		DB:         db,
+		Pool:       pool,
 		FileRepo:   fileRepo,
 		NSRepo:     nsRepo,
-		WorkerPool: pool,
+		WorkerPool: workerPool,
 		MetricsReg: metricsReg,
 	})
 
