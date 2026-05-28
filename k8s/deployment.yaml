@@ -7,7 +7,7 @@ metadata:
     app: cloudbridge-gateway
     version: v1
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels:
       app: cloudbridge-gateway
@@ -17,7 +17,6 @@ spec:
         app: cloudbridge-gateway
         version: v1
       annotations:
-        # Prometheus auto-discovery
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
@@ -25,11 +24,12 @@ spec:
       serviceAccountName: cloudbridge-gateway
       securityContext:
         runAsNonRoot: true
-        runAsUser: 65532   # distroless nonroot UID
-        fsGroup: 65532
+        runAsUser: 1000     # appuser from Dockerfile adduser -D appuser
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 40   # preStop 5s + server drain 30s + buffer
       containers:
         - name: gateway
-          image: cloudbridge/gateway:latest
+          image: cloudbridge:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -39,42 +39,42 @@ spec:
             - configMapRef:
                 name: cloudbridge-config
           env:
-            - name: DB_PASSWORD
+            - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: cloudbridge-secrets
-                  key: db-password
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: cloudbridge-secrets
-                  key: aws-secret-access-key
+                  key: database-url
           resources:
             requests:
-              cpu: "250m"
+              cpu: "100m"
               memory: "128Mi"
             limits:
-              cpu: "1000m"
+              cpu: "500m"
               memory: "512Mi"
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /health
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 15
+            initialDelaySeconds: 15
+            periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /health
               port: http
             initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
             failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Give the load balancer 5 s to drain connections before the
+                # process receives SIGTERM and starts its 30 s graceful shutdown.
+                command: ["/bin/sh", "-c", "sleep 5"]
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
+            readOnlyRootFilesystem: false   # app writes to NFS_BASE_PATH
             capabilities:
               drop: ["ALL"]
-      terminationGracePeriodSeconds: 35   # > server shutdown timeout (30s)

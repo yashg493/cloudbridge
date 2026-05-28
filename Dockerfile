@@ -1,36 +1,41 @@
-# ── Build stage ──────────────────────────────────────────────────────────────
+# ── Stage 1: builder ─────────────────────────────────────────────────────────
 FROM golang:1.22-alpine AS builder
 
-# Required for CGO_ENABLED=0 static binaries + module downloads
-RUN apk add --no-cache git ca-certificates tzdata
+RUN apk add --no-cache git ca-certificates
 
-WORKDIR /build
+WORKDIR /app
 
-# Layer caching: download deps before copying source
+# Cache dependencies before copying source (invalidated only when go.mod changes).
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Build a fully-static binary
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build \
-      -ldflags="-w -s -extldflags '-static'" \
+      -ldflags="-s -w" \
       -trimpath \
-      -o /cloudbridge \
+      -o cloudbridge \
       ./cmd/gateway
 
-# ── Runtime stage ─────────────────────────────────────────────────────────────
-# distroless/static has no shell, no package manager — minimal attack surface.
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+# ── Stage 2: final ───────────────────────────────────────────────────────────
+# alpine:3.19 provides ca-certificates and a real shell while staying small.
+FROM alpine:3.19
 
-# Copy timezone data and CA certs from builder (needed for TLS and time functions)
-COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+RUN apk add --no-cache ca-certificates
 
-COPY --from=builder /cloudbridge /cloudbridge
-# Migrations are read at startup via MIGRATIONS_PATH env var (default: /migrations/001_init.sql)
-COPY --from=builder /build/migrations/ /migrations/
+# Non-root user for least-privilege execution.
+RUN adduser -D appuser
+
+WORKDIR /app
+
+# Binary from builder.
+COPY --from=builder /app/cloudbridge ./cloudbridge
+
+# Migration SQL is read at startup (MIGRATIONS_PATH defaults to migrations/001_init.sql).
+COPY --from=builder /app/migrations/ ./migrations/
 
 EXPOSE 8080
 
-ENTRYPOINT ["/cloudbridge"]
+USER appuser
+
+ENTRYPOINT ["./cloudbridge"]

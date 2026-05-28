@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
 
-  # ── CloudBridge gateway ────────────────────────────────────────────────────
+  # ── CloudBridge gateway ───────────────────────────────────────────────────────
   gateway:
     build:
       context: .
@@ -10,81 +10,55 @@ services:
     ports:
       - "8080:8080"
     environment:
-      DB_HOST: postgres
-      DB_PORT: "5432"
-      DB_USER: cloudbridge
-      DB_PASSWORD: cloudbridge
-      DB_NAME: cloudbridge
-      HTTP_PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/cloudbridge?sslmode=disable
       WORKER_COUNT: "10"
-      WORKER_QUEUE_SIZE: "100"
-      CLOUD_PROVIDER: s3
-      AWS_REGION: us-east-1
-      S3_BUCKET: cloudbridge-local
-      S3_ENDPOINT: http://localstack:4566
-      AWS_ACCESS_KEY_ID: test        # LocalStack accepts any non-empty value
-      AWS_SECRET_ACCESS_KEY: test
+      CLOUD_BACKEND: mock
+      LOG_LEVEL: info
+      NFS_BASE_PATH: /tmp/cloudbridge-nfs
+      MIGRATIONS_PATH: /app/migrations/001_init.sql
     depends_on:
       postgres:
         condition: service_healthy
-      localstack:
-        condition: service_healthy
+    volumes:
+      - ./nfs-data:/tmp/cloudbridge-nfs
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 15s
 
-  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: cloudbridge
-      POSTGRES_PASSWORD: cloudbridge
       POSTGRES_DB: cloudbridge
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     volumes:
-      - pg_data:/var/lib/postgresql/data
-      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cloudbridge"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cloudbridge"]
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 10s
 
-  # ── LocalStack (S3 emulator) ───────────────────────────────────────────────
-  localstack:
-    image: localstack/localstack:3
-    ports:
-      - "4566:4566"
-    environment:
-      SERVICES: s3
-      DEFAULT_REGION: us-east-1
-      PERSISTENCE: 1
-    volumes:
-      - ls_data:/var/lib/localstack
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  # ── Prometheus ────────────────────────────────────────────────────────────
+  # ── Prometheus ──────────────────────────────────────────────────────────────
   prometheus:
-    image: prom/prometheus:v2.50.0
+    image: prom/prometheus:latest
     ports:
       - "9090:9090"
     volumes:
-      - ./k8s/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
       - "--web.enable-lifecycle"
-    depends_on:
-      - gateway
+    restart: unless-stopped
 
 volumes:
-  pg_data:
-  ls_data:
+  postgres_data:

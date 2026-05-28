@@ -3,20 +3,13 @@ kind: ConfigMap
 metadata:
   name: cloudbridge-config
   namespace: cloudbridge
+  labels:
+    app: cloudbridge-gateway
 data:
-  # Database (password supplied via Secret)
-  DB_HOST: "postgres.cloudbridge.svc.cluster.local"
-  DB_PORT: "5432"
-  DB_USER: "cloudbridge"
-  DB_NAME: "cloudbridge"
-  # HTTP server
-  HTTP_PORT: "8080"
-  # Worker pool
   WORKER_COUNT: "10"
-  WORKER_QUEUE_SIZE: "100"
-  # Cloud storage
-  CLOUD_PROVIDER: "s3"
-  AWS_REGION: "us-east-1"
-  S3_BUCKET: "cloudbridge-prod"
-  # Logging
   LOG_LEVEL: "info"
+  NFS_BASE_PATH: "/tmp/cloudbridge-nfs"
+  CLOUD_BACKEND: "mock"
+  # DATABASE_URL and secrets are injected from a Secret object.
+  # Adjust CLOUD_BACKEND to "s3" or "gcs" and add credentials via Secrets
+  # when connecting to a real cloud storage backend.
