@@ -1,6 +1,9 @@
 package api
 
 import (
+	"strconv"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -35,6 +38,19 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	r.Use(middleware.Recovery(cfg.Logger))
 	r.Use(middleware.RequestLogger(cfg.Logger))
 	r.Use(middleware.CORS())
+	// Prometheus API latency histogram.
+	if cfg.MetricsReg != nil {
+		reg := cfg.MetricsReg
+		r.Use(func(c *gin.Context) {
+			start := time.Now()
+			c.Next()
+			reg.APIRequestDuration.WithLabelValues(
+				c.Request.Method,
+				c.FullPath(), // normalized route pattern, safe cardinality
+				strconv.Itoa(c.Writer.Status()),
+			).Observe(time.Since(start).Seconds())
+		})
+	}
 
 	// ── Observability endpoints ──────────────────────────────────────────────────
 	healthHandler := handlers.NewHealthHandler(cfg.Pool, cfg.WorkerPool, cfg.Logger)
@@ -61,7 +77,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// to avoid conflicts with other /:id sub-routes.
 	fileHandler := handlers.NewFileHandler(
 		cfg.FileRepo, cfg.NSRepo, cfg.SyncJobRepo,
-		cfg.NFSSim, cfg.WorkerPool, cfg.Logger,
+		cfg.NFSSim, cfg.WorkerPool, cfg.MetricsReg, cfg.Logger,
 	)
 	v1.POST("/namespaces/:id/files", fileHandler.Register)
 	v1.GET("/namespaces/:id/files", fileHandler.List)

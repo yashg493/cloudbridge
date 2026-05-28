@@ -28,6 +28,8 @@ COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
 COPY --from=builder /cloudbridge /cloudbridge
+# Migrations are read at startup via MIGRATIONS_PATH env var (default: /migrations/001_init.sql)
+COPY --from=builder /build/migrations/ /migrations/
 
 EXPOSE 8080
 

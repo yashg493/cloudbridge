@@ -86,12 +86,12 @@ func (wp *WorkerPool) Submit(job *models.SyncJob) error {
 	select {
 	case wp.jobChan <- job:
 		if wp.deps.Metrics != nil {
-			wp.deps.Metrics.WorkerQueueDepth.Set(float64(len(wp.jobChan)))
+			wp.deps.Metrics.PendingJobs.Set(float64(len(wp.jobChan)))
 		}
 		return nil
 	default:
 		if wp.deps.Metrics != nil {
-			wp.deps.Metrics.WorkerJobsTotal.WithLabelValues(string(job.Operation), "dropped").Inc()
+			wp.deps.Metrics.SyncJobsTotal.WithLabelValues(string(job.Operation), "dropped").Inc()
 		}
 		return ErrPoolFull
 	}
@@ -141,7 +141,8 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 
 	for job := range wp.jobChan {
 		if wp.deps.Metrics != nil {
-			wp.deps.Metrics.WorkerQueueDepth.Set(float64(len(wp.jobChan)))
+			wp.deps.Metrics.PendingJobs.Set(float64(len(wp.jobChan)))
+			wp.deps.Metrics.ActiveWorkers.Inc()
 		}
 
 		start := time.Now()
@@ -156,7 +157,8 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 
 		elapsed := time.Since(start)
 		if wp.deps.Metrics != nil {
-			wp.deps.Metrics.WorkerJobDuration.
+			wp.deps.Metrics.ActiveWorkers.Dec()
+			wp.deps.Metrics.SyncDurationSeconds.
 				WithLabelValues(string(job.Operation)).
 				Observe(elapsed.Seconds())
 		}
@@ -167,13 +169,13 @@ func (wp *WorkerPool) workerLoop(workerID int) {
 				zap.Error(err),
 			)
 			if wp.deps.Metrics != nil {
-				wp.deps.Metrics.WorkerJobsTotal.
+				wp.deps.Metrics.SyncJobsTotal.
 					WithLabelValues(string(job.Operation), "failed").Inc()
 			}
 		} else {
 			log.Debug("job completed", zap.Duration("elapsed", elapsed))
 			if wp.deps.Metrics != nil {
-				wp.deps.Metrics.WorkerJobsTotal.
+				wp.deps.Metrics.SyncJobsTotal.
 					WithLabelValues(string(job.Operation), "completed").Inc()
 			}
 		}

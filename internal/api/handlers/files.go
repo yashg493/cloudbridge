@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/yashg493/cloudbridge/internal/metrics"
 	"github.com/yashg493/cloudbridge/internal/models"
 	"github.com/yashg493/cloudbridge/internal/nfs"
 	"github.com/yashg493/cloudbridge/internal/store"
@@ -22,6 +23,7 @@ type FileHandler struct {
 	syncJobRepo *store.SyncJobRepo
 	nfsSim      *nfs.Simulator
 	workerPool  *worker.WorkerPool
+	metrics     *metrics.Registry
 	logger      *zap.Logger
 }
 
@@ -32,6 +34,7 @@ func NewFileHandler(
 	syncJobRepo *store.SyncJobRepo,
 	nfsSim *nfs.Simulator,
 	workerPool *worker.WorkerPool,
+	metricsReg *metrics.Registry,
 	logger *zap.Logger,
 ) *FileHandler {
 	return &FileHandler{
@@ -40,6 +43,7 @@ func NewFileHandler(
 		syncJobRepo: syncJobRepo,
 		nfsSim:      nfsSim,
 		workerPool:  workerPool,
+		metrics:     metricsReg,
 		logger:      logger,
 	}
 }
@@ -123,6 +127,10 @@ func (h *FileHandler) Register(c *gin.Context) {
 		if err := h.syncJobRepo.Create(ctx, job); err == nil {
 			_ = h.workerPool.Submit(job)
 		}
+	}
+	if h.metrics != nil {
+		h.metrics.FilesRegisteredTotal.
+			WithLabelValues(ns.Name, string(ns.Protocol)).Inc()
 	}
 	created(c, fileMeta)
 }

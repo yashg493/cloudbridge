@@ -69,8 +69,13 @@ func ProcessJob(ctx context.Context, job *models.SyncJob, deps Deps) error {
 			log.Warn("failed to mark job completed", zap.Error(err))
 		}
 		if deps.Metrics != nil {
-			deps.Metrics.TieringOperationsTotal.
-				WithLabelValues(string(job.Operation), "success").Inc()
+			deps.Metrics.SyncJobsTotal.
+				WithLabelValues(string(job.Operation), "completed").Inc()
+			if bytesTransferred > 0 && deps.Provider != nil {
+				deps.Metrics.BytesTransferredTotal.
+					WithLabelValues(string(job.Operation), deps.Provider.Name()).
+					Add(float64(bytesTransferred))
+			}
 		}
 		log.Info("sync job completed", zap.Int64("bytes_transferred", bytesTransferred))
 		return nil
@@ -79,7 +84,7 @@ func ProcessJob(ctx context.Context, job *models.SyncJob, deps Deps) error {
 	// ── Step 4: transient failure — retry with exponential back-off ───────────
 	log.Warn("sync job failed", zap.Error(opErr))
 	if deps.Metrics != nil {
-		deps.Metrics.TieringOperationsTotal.
+		deps.Metrics.SyncJobsTotal.
 			WithLabelValues(string(job.Operation), "error").Inc()
 	}
 
