@@ -16,6 +16,7 @@ import (
 	"github.com/yashg493/cloudbridge/internal/api"
 	"github.com/yashg493/cloudbridge/internal/cloud"
 	"github.com/yashg493/cloudbridge/internal/metrics"
+	"github.com/yashg493/cloudbridge/internal/nfs"
 	"github.com/yashg493/cloudbridge/internal/store"
 	"github.com/yashg493/cloudbridge/internal/worker"
 )
@@ -69,6 +70,12 @@ func run(ctx context.Context, logger *zap.Logger) error {
 	nsRepo := store.NewNamespaceRepo(pool)
 	syncJobRepo := store.NewSyncJobRepo(pool)
 
+	// ── NFS simulator ────────────────────────────────────────────────────────────
+	nfsSim, err := nfs.New(getEnv("NFS_BASE_PATH", ""), logger)
+	if err != nil {
+		return fmt.Errorf("failed to initialise NFS simulator: %w", err)
+	}
+
 	// ── Cloud provider ─────────────────────────────────────────────────────────────
 	// Returns S3Provider when AWS_REGION + AWS_BUCKET are set; MockS3Provider otherwise.
 	cloudProvider := cloud.NewProvider(ctx, logger)
@@ -104,12 +111,14 @@ func run(ctx context.Context, logger *zap.Logger) error {
 
 	// ── HTTP server ──────────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
-		Logger:     logger,
-		Pool:       pool,
-		FileRepo:   fileRepo,
-		NSRepo:     nsRepo,
-		WorkerPool: workerPool,
-		MetricsReg: metricsReg,
+		Logger:      logger,
+		Pool:        pool,
+		FileRepo:    fileRepo,
+		NSRepo:      nsRepo,
+		SyncJobRepo: syncJobRepo,
+		WorkerPool:  workerPool,
+		NFSSim:      nfsSim,
+		MetricsReg:  metricsReg,
 	})
 
 	srv := &http.Server{

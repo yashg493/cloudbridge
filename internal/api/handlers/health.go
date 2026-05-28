@@ -6,52 +6,57 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+
+	"github.com/yashg493/cloudbridge/internal/worker"
 )
 
-// HealthHandler serves Kubernetes liveness and readiness probes.
+const version = "1.0.0"
+
+// HealthHandler serves the /health endpoint and legacy k8s probes.
 type HealthHandler struct {
-	pool   *pgxpool.Pool
-	logger *zap.Logger
+	pool       *pgxpool.Pool
+	workerPool *worker.WorkerPool
+	logger     *zap.Logger
 }
 
 // NewHealthHandler creates a HealthHandler.
-func NewHealthHandler(pool *pgxpool.Pool, logger *zap.Logger) *HealthHandler {
-	return &HealthHandler{pool: pool, logger: logger}
+func NewHealthHandler(pool *pgxpool.Pool, workerPool *worker.WorkerPool, logger *zap.Logger) *HealthHandler {
+	return &HealthHandler{pool: pool, workerPool: workerPool, logger: logger}
 }
 
-// Liveness handles GET /healthz.
-// Returns 200 as long as the process is running; does not check dependencies.
-func (h *HealthHandler) Liveness(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
-}
+// Health handles GET /health.
+// Returns system status including DB connectivity and active worker count.
+func (h *HealthHandler) Health(c *gin.Context) {
+	ctx := c.Request.Context()
 
-// Readiness handles GET /readyz.
-// Returns 200 only when all critical dependencies are healthy.
-// Returns 503 with a JSON body describing which checks failed.
-func (h *HealthHandler) Readiness(c *gin.Context) {
-	checks := map[string]string{}
-	healthy := true
+	dbStatus := "connected"
+	overall := http.StatusOK
 
-	// Database check
-	if h.pool != nil {
-		if err := h.pool.Ping(c.Request.Context()); err != nil {
-			h.logger.Warn("readiness: db check failed", zap.Error(err))
-			checks["database"] = err.Error()
-			healthy = false
-		} else {
-			checks["database"] = "ok"
-		}
-	} else {
-		checks["database"] = "not initialised"
-		healthy = false
+	if h.pool == nil {
+		dbStatus = "not initialised"
+		overall = http.StatusServiceUnavailable
+	} else if err := h.pool.Ping(ctx); err != nil {
+		h.logger.Warn("health: db ping failed", zap.Error(err))
+		dbStatus = "error: " + err.Error()
+		overall = http.StatusServiceUnavailable
 	}
 
-	// TODO: add cloud provider connectivity check
-	// TODO: add worker pool liveness check
-
-	if !healthy {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "checks": checks})
-		return
+	var activeWorkers int32
+	if h.workerPool != nil {
+		activeWorkers = h.workerPool.ActiveWorkers()
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ready", "checks": checks})
+
+	status := "ok"
+	if overall != http.StatusOK {
+		status = "degraded"
+	}
+
+	c.JSON(overall, Response{
+		Data: gin.H{
+			"status":         status,
+			"db":             dbStatus,
+			"active_workers": activeWorkers,
+			"version":        version,
+		},
+	})
 }

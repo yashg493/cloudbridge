@@ -82,6 +82,18 @@ const (
 
 	sqlSJCountByStatus = `SELECT status, COUNT(*) FROM sync_jobs GROUP BY status`
 
+	// List all jobs with optional status filter and pagination.
+	sqlSJList = `
+		SELECT ` + sqlSJCols + `
+		FROM   sync_jobs
+		WHERE  @status = '' OR status = @status
+		ORDER  BY created_at DESC
+		LIMIT  @limit OFFSET @offset`
+
+	sqlSJCount = `
+		SELECT COUNT(*) FROM sync_jobs
+		WHERE  @status = '' OR status = @status`
+
 	// RequeueWithRetry resets a failed/running job back to pending and increments
 	// retry_count atomically — used by ProcessJob's exponential back-off path.
 	sqlSJRequeueWithRetry = `
@@ -234,6 +246,31 @@ func (r *SyncJobRepo) RequeueWithRetry(ctx context.Context, id uuid.UUID, errMsg
 		return fmt.Errorf("sync_job_repo.RequeueWithRetry: %w", err)
 	}
 	return nil
+}
+
+// List returns all sync jobs with an optional status filter and pagination.
+// Pass status="" to return jobs of any status.
+func (r *SyncJobRepo) List(ctx context.Context, status string, limit, offset int) ([]*models.SyncJob, error) {
+	rows, err := r.pool.Query(ctx, sqlSJList, pgx.NamedArgs{
+		"status": status,
+		"limit":  limit,
+		"offset": offset,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sync_job_repo.List: %w", err)
+	}
+	return collectJobRows(rows)
+}
+
+// Count returns the total number of sync jobs matching the optional status filter.
+// Pass status="" to count all jobs.
+func (r *SyncJobRepo) Count(ctx context.Context, status string) (int64, error) {
+	var n int64
+	err := r.pool.QueryRow(ctx, sqlSJCount, pgx.NamedArgs{"status": status}).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("sync_job_repo.Count: %w", err)
+	}
+	return n, nil
 }
 
 // collectJobRows drains pgx.Rows into a []*models.SyncJob slice.
