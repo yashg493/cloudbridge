@@ -47,6 +47,30 @@ services:
       retries: 10
       start_period: 10s
 
+  # ── Tiering Advisor ────────────────────────────────────────────────────────────
+  tiering-advisor:
+    build:
+      context: ./tiering-advisor
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/cloudbridge
+      CLOUDBRIDGE_URL: http://gateway:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   # ── Prometheus ──────────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
